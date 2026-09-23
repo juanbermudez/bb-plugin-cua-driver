@@ -12,6 +12,7 @@ import {
   hostContract,
   hostSignals,
   type CatalogTool,
+  type DriverGrant,
   type DriverStatus,
   type InstallState,
   type ToolCallResult,
@@ -19,10 +20,11 @@ import {
 } from "./src/contract.js";
 import { McpStdioClient, type McpChild, type McpContentPart } from "./src/mcp-client.js";
 
-export const PLUGIN_VERSION = "0.1.0";
+export const PLUGIN_VERSION = "0.2.0";
 const BINARY_CACHE_MS = 60_000;
 const PROBE_TIMEOUT_MS = 8_000;
 const GRANT_TIMEOUT_MS = 120_000;
+const DAEMON_START_TIMEOUT_MS = 10_000;
 const DEFAULT_IDLE_DISCONNECT_MS = 10 * 60_000;
 const STRUCTURED_TEXT_LIMIT = 200_000;
 const INSTALL_TAIL_LINES = 80;
@@ -50,6 +52,7 @@ export interface HostDependencies {
   readonly homeDir: string;
   readonly idleDisconnectMs?: number;
   now(): number;
+  sleep(ms: number): Promise<void>;
   fileExists(path: string): Promise<boolean>;
   exec(command: string, args: readonly string[], timeoutMs: number): Promise<ExecResult>;
   spawnMcp(command: string, args: readonly string[]): McpChild;
@@ -135,6 +138,32 @@ export function parsePermissions(stdout: string): DriverStatus["permissions"] {
   }
 }
 
+/** Reads `cua-driver check-update --json`; unknown shapes report nothing rather than guess. */
+export function parseUpdateCheck(stdout: string): { latestVersion: string | null; updateAvailable: boolean | null } {
+  try {
+    const parsed: unknown = JSON.parse(stdout);
+    if (typeof parsed !== "object" || parsed === null) return { latestVersion: null, updateAvailable: null };
+    const record = parsed as Record<string, unknown>;
+    return {
+      latestVersion: typeof record.latest_version === "string" ? record.latest_version : null,
+      updateAvailable: typeof record.update_available === "boolean" ? record.update_available : null,
+    };
+  } catch {
+    return { latestVersion: null, updateAvailable: null };
+  }
+}
+
+/**
+ * Grants a running `cua-driver serve` daemon was started with, read from its
+ * command line (`ps -axo command=`); null when no daemon is running. Grants
+ * belong to the daemon: `cua-driver mcp --grant` is refused while one listens.
+ */
+export function parseDaemonGrants(psOutput: string): string[] | null {
+  const line = psOutput.split("\n").find((entry) => /cua-driver\s+serve(\s|$)/.test(entry));
+  if (line === undefined) return null;
+  return [...line.matchAll(/--grant(?:=|\s+)(\S+)/g)].map((match) => match[1] ?? "").filter(Boolean).sort();
+}
+
 export function mapContent(parts: McpContentPart[], structured: unknown): ToolContentPart[] {
   const mapped: ToolContentPart[] = [];
   for (const part of parts) {
@@ -165,6 +194,7 @@ export function createCuaHostEntry(deps: HostDependencies) {
   let binaryCache: { path: string | null; at: number } | null = null;
   let client: McpStdioClient | null = null;
   let connecting: Promise<McpStdioClient> | null = null;
+  let connectedArgs: string | null = null;
   let tools: CatalogTool[] = [];
   let lease: ExperimentalHostWorkerLease | null = null;
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -207,13 +237,48 @@ export function createCuaHostEntry(deps: HostDependencies) {
     lease = null;
     void activeLease?.dispose();
     if (active === null) return false;
+    connectedArgs = null;
     active.close(reason);
     return true;
   }
 
+  /**
+   * Makes sure the daemon carries every requested grant, restarting it with
+   * them on macOS. Never removes a grant: someone else may have started the
+   * daemon that way for another client.
+   */
+  async function ensureDaemonGrants(binary: string, grants: readonly DriverGrant[]): Promise<void> {
+    if (grants.length === 0) return;
+    const listing = await deps.exec("ps", ["-axo", "command="], PROBE_TIMEOUT_MS);
+    const current = listing.code === 0 ? parseDaemonGrants(listing.stdout) : null;
+    if (current !== null && grants.every((grant) => current.includes(grant))) return;
+    const flags = [...new Set([...(current ?? []), ...grants])].sort().flatMap((grant) => ["--grant", grant]);
+    if (deps.platform !== "darwin") {
+      throw new Error(
+        `Signed-in browser profiles need the Cua Driver service started with ${flags.join(" ")}. Run \`cua-driver stop\` and then \`cua-driver serve ${flags.join(" ")}\` on this machine.`,
+      );
+    }
+    if (current !== null) await deps.exec(binary, ["stop"], PROBE_TIMEOUT_MS);
+    // LaunchServices, so the daemon keeps CuaDriver.app's own macOS permissions.
+    await deps.exec("open", ["-n", "-g", "-a", "CuaDriver", "--args", "serve", ...flags], PROBE_TIMEOUT_MS);
+    const deadline = deps.now() + DAEMON_START_TIMEOUT_MS;
+    while (deps.now() < deadline) {
+      const status = await deps.exec(binary, ["status"], PROBE_TIMEOUT_MS);
+      if (status.code === 0) return;
+      await deps.sleep(250);
+    }
+    throw new Error(`The Cua Driver service did not come back after restarting it with ${flags.join(" ")}.`);
+  }
+
   async function connect(
     context: { experimental_retainWorker(): ExperimentalHostWorkerLease },
+    grants: readonly DriverGrant[],
   ): Promise<McpStdioClient> {
+    const wanted = [...grants].sort().join(",");
+    // A newly required grant means restarting the daemon, which drops this connection.
+    if (client !== null && !client.isClosed && connectedArgs !== wanted && grants.length > 0) {
+      disconnect("driver grants changed");
+    }
     if (client !== null && !client.isClosed) {
       armIdleTimer();
       return client;
@@ -226,6 +291,7 @@ export function createCuaHostEntry(deps: HostDependencies) {
           "cua-driver is not installed on this machine. Install it from https://cua.ai/docs/how-to-guides/driver/install and run `cua-driver doctor`.",
         );
       }
+      await ensureDaemonGrants(binary, grants);
       const child = deps.spawnMcp(binary, ["mcp"]);
       const next = new McpStdioClient(child);
       next.onClose((reason) => {
@@ -252,6 +318,7 @@ export function createCuaHostEntry(deps: HostDependencies) {
         );
       }
       client = next;
+      connectedArgs = wanted;
       lease ??= context.experimental_retainWorker();
       armIdleTimer();
       emitConnection?.(true, "connected");
@@ -282,6 +349,8 @@ export function createCuaHostEntry(deps: HostDependencies) {
       daemonRunning: null,
       permissions: null,
       connected: client !== null && !client.isClosed,
+      latestVersion: null,
+      updateAvailable: null,
       toolCount: tools.length > 0 ? tools.length : null,
       error: null,
       checkedAt,
@@ -305,6 +374,11 @@ export function createCuaHostEntry(deps: HostDependencies) {
         (): ExecResult => ({ code: null, stdout: "", stderr: "" }),
       );
       base.daemonRunning = status.code === 0;
+      // cua-driver caches this answer on disk for 20 hours, so probing often is cheap.
+      const update = await deps.exec(binary, ["check-update", "--json"], PROBE_TIMEOUT_MS).catch(
+        (): ExecResult => ({ code: null, stdout: "", stderr: "" }),
+      );
+      if (update.code === 0) Object.assign(base, parseUpdateCheck(update.stdout));
     }
     if (platform === "darwin") {
       const permissions = await deps
@@ -350,6 +424,12 @@ export function createCuaHostEntry(deps: HostDependencies) {
     const installLease = context.experimental_retainWorker();
     const isWindows = deps.platform === "win32";
     try {
+      const existing = await resolveBinary();
+      if (existing !== null) {
+        // Updating in place: release the old binary before the installer replaces it.
+        disconnect("updating cua-driver");
+        await runStep(existing, ["stop"], "stop-service").catch(() => null);
+      }
       const url = isWindows ? INSTALL_SCRIPT_URLS.windows : INSTALL_SCRIPT_URLS.posix;
       pushInstallLine(`Downloading ${url}`, "download");
       const script = await deps.fetchText(url, context.lifecycle.signal);
@@ -460,12 +540,12 @@ export function createCuaHostEntry(deps: HostDependencies) {
         bindLifecycle(context.lifecycle.signal);
         return probeStatus(input.probeDaemon);
       },
-      async listTools(_input, context) {
+      async listTools(input, context) {
         bindLifecycle(context.lifecycle.signal);
         emitConnection ??= (connected, reason) => {
           void context.experimental_emitSignal("connectionChanged", { connected, reason });
         };
-        await connect(context);
+        await connect(context, input.grants);
         return { tools };
       },
       async callTool(input, context): Promise<ToolCallResult> {
@@ -473,7 +553,7 @@ export function createCuaHostEntry(deps: HostDependencies) {
         emitConnection ??= (connected, reason) => {
           void context.experimental_emitSignal("connectionChanged", { connected, reason });
         };
-        const active = await connect(context);
+        const active = await connect(context, input.grants);
         const args: Record<string, unknown> = { ...input.arguments };
         if (input.session !== undefined && acceptsSession(input.name) && !("session" in args)) {
           args.session = input.session;
@@ -520,6 +600,7 @@ export default createCuaHostEntry({
   env: process.env,
   homeDir: homedir(),
   now: () => Date.now(),
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   fileExists: (path) => access(path).then(() => true, () => false),
   exec: execCommand,
   spawnMcp(command, args) {

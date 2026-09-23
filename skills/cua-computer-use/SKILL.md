@@ -54,9 +54,20 @@ Pass `pid` on keyboard tools (`cua_press_key`, `cua_hotkey`,
 Bind the native window once with `cua_get_browser_state({pid, window_id})`,
 then act through `cua_browser_click`, `cua_browser_type`,
 `cua_browser_navigate`, and `cua_browser_pointer` using the returned
-`target_id`, `tab_id`, and `ref`. Refs expire on the next snapshot. Attaching
-to a signed-in profile needs a grant the user configures outside bb; if the
-driver refuses, say so instead of retrying.
+`target_id`, `tab_id`, and `ref`. Refs expire on the next snapshot; take them
+from `refs` in a `snapshot_format: "semantic_v2"` read, narrowed with `query`.
+
+- A Chrome or Edge window people use daily is a signed-in profile. Attaching
+  needs `cua_browser_prepare({pid, window_id, strategy: {kind:
+  "existing_profile"}})` and the **Signed-in browser profiles** setting; if the
+  tool says the setting is off, ask the user instead of working around it.
+- On macOS, background clicks need `input_route: "dom_event"`; the default
+  trusted route is refused unless the window may come to the front.
+- `cua_browser_download` saves into an existing absolute directory the user
+  approved (`destination_root`); confirm the folder before downloading.
+- Refusals come back as ordinary results reading `refused (<code>)` with a
+  `next_action`; read them, they are not successes. If the driver refuses,
+  say so instead of retrying the same call.
 
 ## Readiness and errors
 
@@ -65,6 +76,10 @@ driver refuses, say so instead of retrying.
   installed or refuses with `permission_required`.
 - `No cached AX state` or `stale_element_token`: re-snapshot, then act.
 - `ambiguous_window_target`: pass an explicit `window_id`.
+- `AXPress returned -25204` right after launching an app: the app is still
+  busy; re-snapshot and retry once.
+- Sessions are managed for you: every call in this thread shares one Cua
+  session, renewed automatically if the driver ended it.
 - Long tail tools (recording, cursor themes, sessions, `page`) are reachable
   through `cua_call {tool, arguments}`; read the schema with `cua_describe`.
 

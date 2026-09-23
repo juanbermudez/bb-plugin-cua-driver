@@ -446,7 +446,12 @@ function setupChecks(host: Host): SetupCheck[] {
     {
       label: "Cua Driver",
       detail: driver === null ? "Check setup to inspect this machine" : undefined,
-      meta: driver?.installed && driver.version !== null ? `v${driver.version}` : undefined,
+      meta:
+        driver?.installed && driver.version !== null
+          ? driver.updateAvailable === true && driver.latestVersion !== null
+            ? `v${driver.version} · v${driver.latestVersion} available`
+            : `v${driver.version}`
+          : undefined,
       state: driver === null ? "waiting" : driver.installed ? "complete" : "required",
     },
   ];
@@ -602,6 +607,8 @@ function MachineSetupPanel({
   const refreshing = busy === `status:${host.id}`;
   const granting = busy === `grant:${host.id}`;
   const canInstall = driver !== null && !driver.installed;
+  // An update reuses the installer flow: it stops the driver, installs the newest release and restarts it.
+  const canUpdate = driver !== null && driver.installed && driver.updateAvailable === true;
   const canGrant =
     driver?.platform === "darwin" &&
     driver.installed &&
@@ -620,7 +627,7 @@ function MachineSetupPanel({
   }
   const summaryTone = install.ok === false ? "text-destructive-text" : needsAction || install.running ? "text-warning-text" : "text-success-foreground";
   const showRefresh = needsAction && !install.running;
-  const showActions = canInstall || canGrant || showRefresh;
+  const showActions = canInstall || canUpdate || canGrant || showRefresh;
 
   return (
     <div role="listitem" data-machine-row>
@@ -668,9 +675,15 @@ function MachineSetupPanel({
 
           {showActions ? (
             <div className="mt-3 grid gap-2">
-              {canInstall ? (
+              {canInstall || canUpdate ? (
                 <Button className="min-h-10 w-full rounded-full" disabled={busy !== null && !install.running} onClick={onOpenInstall}>
-                  {install.running ? "View progress" : install.ok === false ? "Retry install…" : "Install Cua Driver…"}
+                  {install.running
+                    ? "View progress"
+                    : install.ok === false
+                      ? "Retry install…"
+                      : canUpdate
+                        ? `Update to v${driver?.latestVersion ?? "latest"}…`
+                        : "Install Cua Driver…"}
                 </Button>
               ) : null}
               {canGrant ? (

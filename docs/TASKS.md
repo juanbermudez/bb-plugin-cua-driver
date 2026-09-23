@@ -31,23 +31,50 @@ Legend: ✅ done in this repo · ⏳ needs a live machine with Cua Driver · ☐
   signal, two-step confirm in the UI, `bb cua install --yes`) and macOS
   `grantPermissions` (`bb cua grant`) + tests.
 
-## M2 — Live validation (⏳, 1–2 days)
+## M2 — Live validation (partly ✅, against Cua Driver 0.28.2 on macOS 26)
 
-- ⏳ Install Cua Driver on a macOS machine, grant permissions, run
-  `bb cua status` and confirm version/permission parsing against real
-  `permissions status --json` output; adjust `parsePermissions` keys.
-- ⏳ Confirm `cua-driver status` exit-code semantics for `daemonRunning`.
-- ⏳ Drive the tutorial task ("open Calculator, compute 6×7") from a Claude
-  Code thread and a Pi thread; check screenshots render in the timeline.
+`live.test.ts` (`npm run test:live`) runs the plugin's own server code in the
+SDK's fake bb host wired to its real host entry, so each call takes the path a
+thread's would: agent tool → server → host RPC → `cua-driver mcp` → daemon.
+
+- ✅ Updated Cua Driver 0.23.2 → 0.28.2 with the official installer; version
+  and `permissions status --json` parsing confirmed against real output (the
+  0.28.2 payload is a fixture in `host.test.ts`).
+- ✅ `cua-driver status` exits 0 exactly when the daemon is running.
+- ✅ Calculator 6×7 through the plugin's tools (launch → window state →
+  element-token clicks → reads 42), in the background.
+- ✅ Browser flow: attach to a running Chrome (`existing_profile`), navigate,
+  semantic snapshot, `cua_browser_download` of a CSV into an approved folder.
+- ⏳ The same tasks from a real Claude Code thread and a Pi thread in bb.app;
+  check screenshots render in the timeline.
 - ⏳ Verify Codex thread receives no `cua_*` tools in `prefer-native` and
   does in `cua-everywhere`.
-- ⏳ Browser flow: `cua_get_browser_state` → `cua_browser_click` on Chrome.
 - ⏳ Remote machine: enroll a second host, run a thread there, confirm the
   host RPC path and idle disconnect (10 min) release the worker.
 - ⏳ Windows via WSL2 note: bb's daemon runs inside WSL2, so the Windows
   desktop is not reachable from bb today. Document as unsupported unless the
   daemon gains a native Windows path.
 - ⏳ Linux X11 pass on Ubuntu with AT-SPI.
+
+### What 0.28 changed underneath 0.1.0 (fixed in 0.2.0)
+
+- The hand-written schemas had drifted: `scroll` `by` rejected the valid
+  `"line"`/`"page"`, and newer parameters (`click` `target`/`from_zoom`,
+  `browser_prepare` `profile`/`strategy`, `launch_app`
+  `creates_new_application_instance`) were stripped before reaching the
+  driver. Schemas now come from `tools/list`.
+- A session ends with the connection that carried it, and a reused label is
+  refused ("session '…' has ended … use a new session id"). Any MCP restart
+  broke every thread on that machine until the plugin restarted.
+- `browser_prepare` with `allow_launch` is refused for a user-installed Chrome
+  ("no vendor-signed system Chromium executable"), so agents attach to an
+  existing window instead. That needs the daemon started with
+  `--grant existing-profile`; `cua-driver mcp --grant` is refused while a
+  daemon listens.
+- Background clicks in a browser need `input_route: "dom_event"` on macOS.
+- Refusals come back as ordinary results (`isError: false`, "refused (code)").
+- AX presses right after an app launches can fail with -25204; a fresh
+  snapshot and retry succeeds.
 
 ## M3 — Release and marketplace (☐, half a day)
 
@@ -61,8 +88,8 @@ Legend: ✅ done in this repo · ⏳ needs a live machine with Cua Driver · ☐
 
 ## M4 — Follow-ups (☐)
 
-- ☐ Live schema narrowing from the machine's `tools/list` via
-  `configure()` parameter overrides.
+- ✅ Live schemas from the machine's `tools/list` via `configure()` parameter
+  overrides when its driver version differs from the bundled snapshot (0.2.0).
 - ☐ Thread header chip (session state, stop button).
 - ☐ Trajectory recording panel with MP4 preview.
 - ☐ Upstream bb proposal: `provider.capabilities.supportsNativeComputerUse`.

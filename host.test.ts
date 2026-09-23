@@ -1,7 +1,15 @@
 import { PassThrough } from "node:stream";
 import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
 import { describe, expect, it, vi } from "vitest";
-import { candidateBinaryPaths, createCuaHostEntry, mapContent, parsePermissions, type ExecResult } from "./host.js";
+import {
+  candidateBinaryPaths,
+  createCuaHostEntry,
+  mapContent,
+  parseDaemonGrants,
+  parsePermissions,
+  parseUpdateCheck,
+  type ExecResult,
+} from "./host.js";
 import type { McpChild } from "./src/mcp-client.js";
 
 function fakeMcpServer(tools: Array<{ name: string; inputSchema: Record<string, unknown> }>) {
@@ -52,10 +60,24 @@ function fakeMcpServer(tools: Array<{ name: string; inputSchema: Record<string, 
 
 function deps(overrides: Partial<Parameters<typeof createCuaHostEntry>[0]> & { installed?: boolean; server?: ReturnType<typeof fakeMcpServer> }) {
   const installed = overrides.installed ?? true;
+  const daemonCommand = { current: "/Applications/CuaDriver.app/Contents/MacOS/cua-driver serve" };
   const server = overrides.server ?? fakeMcpServer([]);
   const exec = vi.fn(async (_command: string, args: readonly string[]): Promise<ExecResult> => {
+    if (_command === "ps") return { code: 0, stdout: `/usr/sbin/cfprefsd agent\n${daemonCommand.current}\n`, stderr: "" };
+    if (_command === "open") {
+      daemonCommand.current = `/Applications/CuaDriver.app/Contents/MacOS/cua-driver ${args.slice(args.indexOf("--args") + 1).join(" ")}`;
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (args[0] === "stop") return { code: 0, stdout: "", stderr: "" };
     if (args[0] === "--version") return { code: 0, stdout: "cua-driver 0.23.2\n", stderr: "" };
     if (args[0] === "status") return { code: 0, stdout: "running", stderr: "" };
+    if (args[0] === "check-update") {
+      return {
+        code: 0,
+        stdout: JSON.stringify({ current_version: "0.23.2", latest_version: "0.28.2", update_available: true }),
+        stderr: "",
+      };
+    }
     if (args[0] === "permissions") {
       return { code: 0, stdout: JSON.stringify({ accessibility: { granted: true }, screen_recording: { granted: false } }), stderr: "" };
     }
@@ -71,6 +93,7 @@ function deps(overrides: Partial<Parameters<typeof createCuaHostEntry>[0]> & { i
       env: { PATH: "/usr/bin", HOME: "/Users/test" },
       homeDir: "/Users/test",
       now: () => 1_000,
+      sleep: async () => undefined,
       fileExists: async (path) => installedRef.current && path === "/Users/test/.local/bin/cua-driver",
       exec,
       spawnMcp,
@@ -91,6 +114,7 @@ function deps(overrides: Partial<Parameters<typeof createCuaHostEntry>[0]> & { i
     written,
     processes,
     installedRef,
+    daemonCommand,
   };
 }
 
@@ -146,6 +170,41 @@ describe("parsePermissions / mapContent", () => {
     expect(parsePermissions("not json")).toEqual({ accessibility: null, screenRecording: null, directCapture: null });
   });
 
+  it("reads cua-driver 0.28.2's permissions payload exactly as the daemon prints it", () => {
+    const live = JSON.stringify({
+      accessibility: true,
+      direct_capture_error: null,
+      direct_capture_status: "not_checked",
+      screen_recording: true,
+      screen_recording_capturable: null,
+      source: {
+        attribution: "driver-daemon",
+        bundle_id: "com.trycua.driver",
+        disclaim_env: false,
+        executable: "/Applications/CuaDriver.app/Contents/MacOS/cua-driver",
+        pid: 90248,
+        responsible_ppid: 1,
+      },
+    });
+    expect(parsePermissions(live)).toEqual({ accessibility: true, screenRecording: true, directCapture: "not_checked" });
+  });
+
+  it("reads the grants a running daemon was started with", () => {
+    expect(parseDaemonGrants("/bin/zsh\n/Applications/CuaDriver.app/Contents/MacOS/cua-driver serve --grant existing-profile\n")).toEqual([
+      "existing-profile",
+    ]);
+    expect(parseDaemonGrants("/Applications/CuaDriver.app/Contents/MacOS/cua-driver serve\n")).toEqual([]);
+    expect(parseDaemonGrants("/Applications/CuaDriver.app/Contents/MacOS/cua-driver mcp\n")).toBeNull();
+  });
+
+  it("reads check-update and reports nothing for an unreadable answer", () => {
+    expect(parseUpdateCheck(JSON.stringify({ latest_version: "0.28.2", update_available: false }))).toEqual({
+      latestVersion: "0.28.2",
+      updateAvailable: false,
+    });
+    expect(parseUpdateCheck("not json")).toEqual({ latestVersion: null, updateAvailable: null });
+  });
+
   it("keeps images, appends structured content, and never returns empty content", () => {
     const mapped = mapContent([{ type: "image", data: "AA", mimeType: "image/jpeg" }], { a: 1 });
     expect(mapped).toEqual([
@@ -163,7 +222,7 @@ describe("cua host entry", () => {
     const status = await harness.experimental_call("status", { probeDaemon: true });
     expect(status).toMatchObject({ installed: false, binaryPath: null, version: null, platform: "darwin" });
     expect(exec).not.toHaveBeenCalled();
-    await expect(harness.experimental_call("callTool", { name: "list_apps", arguments: {} })).rejects.toThrow(/not installed/);
+    await expect(harness.experimental_call("callTool", { name: "list_apps", arguments: {}, grants: [] })).rejects.toThrow(/not installed/);
     await harness.experimental_dispose();
   });
 
@@ -178,6 +237,8 @@ describe("cua host entry", () => {
       daemonRunning: true,
       permissions: { accessibility: true, screenRecording: false },
       connected: false,
+      latestVersion: "0.28.2",
+      updateAvailable: true,
     });
     await harness.experimental_dispose();
   });
@@ -190,12 +251,12 @@ describe("cua host entry", () => {
     const { entry, spawnMcp } = deps({ server });
     const harness = experimental_createHostEntryHarness(entry);
 
-    const first = await harness.experimental_call("callTool", { name: "click", arguments: { pid: 1 }, session: "bb-thr_1" });
+    const first = await harness.experimental_call("callTool", { name: "click", arguments: { pid: 1 }, session: "bb-thr_1", grants: [] });
     expect(first.content[0]).toEqual({ type: "text", text: "ran click" });
     expect(first.content[1]).toEqual({ type: "image", data: "QUJD", mimeType: "image/png" });
     expect(first.isError).toBe(false);
-    await harness.experimental_call("callTool", { name: "list_apps", arguments: {}, session: "bb-thr_1" });
-    const failed = await harness.experimental_call("callTool", { name: "fail", arguments: {} });
+    await harness.experimental_call("callTool", { name: "list_apps", arguments: {}, session: "bb-thr_1", grants: [] });
+    const failed = await harness.experimental_call("callTool", { name: "fail", arguments: {}, grants: [] });
     expect(failed.isError).toBe(true);
 
     expect(spawnMcp).toHaveBeenCalledTimes(1);
@@ -207,7 +268,7 @@ describe("cua host entry", () => {
     ]);
     expect(harness.experimental_getRetainedWorkerLeaseCount()).toBe(1);
 
-    const listed = await harness.experimental_call("listTools", null);
+    const listed = await harness.experimental_call("listTools", { grants: [] });
     expect(listed.tools.map((tool) => tool.name)).toEqual(["click", "list_apps"]);
     const status = await harness.experimental_call("status", { probeDaemon: false });
     expect(status).toMatchObject({ connected: true, toolCount: 2, daemonRunning: null });
@@ -223,7 +284,7 @@ describe("cua host entry", () => {
     const harness = experimental_createHostEntryHarness(entry);
 
     const started = await harness.experimental_call("install", null);
-    expect(started).toMatchObject({ running: true, ok: null, step: "download" });
+    expect(started).toMatchObject({ running: true, ok: null, step: "starting" });
     expect(harness.experimental_getRetainedWorkerLeaseCount()).toBe(1);
     await flush();
     expect(written[0]?.path).toMatch(/cua-driver-install\.sh$/);
@@ -243,6 +304,57 @@ describe("cua host entry", () => {
     expect(state.tail).toContain("Installed cua-driver 0.23.2");
     expect(harness.experimental_getRetainedWorkerLeaseCount()).toBe(0);
     expect(await harness.experimental_call("status", { probeDaemon: false })).toMatchObject({ installed: true });
+    await harness.experimental_dispose();
+  });
+
+  it("restarts the daemon with a requested grant and never passes it to mcp", async () => {
+    const server = fakeMcpServer([{ name: "list_apps", inputSchema: { type: "object", properties: {} } }]);
+    const { entry, spawnMcp, exec, daemonCommand } = deps({ server });
+    const harness = experimental_createHostEntryHarness(entry);
+
+    await harness.experimental_call("callTool", { name: "list_apps", arguments: {}, grants: [] });
+    expect(exec).not.toHaveBeenCalledWith("open", expect.anything(), expect.anything());
+
+    await harness.experimental_call("callTool", { name: "list_apps", arguments: {}, grants: ["existing-profile"] });
+    expect(exec).toHaveBeenCalledWith("/Users/test/.local/bin/cua-driver", ["stop"], expect.any(Number));
+    expect(exec).toHaveBeenCalledWith(
+      "open",
+      ["-n", "-g", "-a", "CuaDriver", "--args", "serve", "--grant", "existing-profile"],
+      expect.any(Number),
+    );
+    expect(daemonCommand.current).toContain("serve --grant existing-profile");
+    expect(spawnMcp).toHaveBeenCalledTimes(2);
+    expect(spawnMcp).toHaveBeenNthCalledWith(1, "/Users/test/.local/bin/cua-driver", ["mcp"]);
+    expect(spawnMcp).toHaveBeenNthCalledWith(2, "/Users/test/.local/bin/cua-driver", ["mcp"]);
+    await harness.experimental_dispose();
+  });
+
+  it("leaves a daemon that already carries the grant alone", async () => {
+    const server = fakeMcpServer([{ name: "list_apps", inputSchema: { type: "object", properties: {} } }]);
+    const { entry, exec, daemonCommand } = deps({ server });
+    daemonCommand.current = "/Applications/CuaDriver.app/Contents/MacOS/cua-driver serve --grant existing-profile";
+    const harness = experimental_createHostEntryHarness(entry);
+    await harness.experimental_call("callTool", { name: "list_apps", arguments: {}, grants: ["existing-profile"] });
+    expect(exec).not.toHaveBeenCalledWith("open", expect.anything(), expect.anything());
+    expect(exec).not.toHaveBeenCalledWith(expect.any(String), ["stop"], expect.any(Number));
+    await harness.experimental_dispose();
+  });
+
+  it("stops the running driver before an update replaces it", async () => {
+    const { entry, processes, written } = deps({ installed: true });
+    const harness = experimental_createHostEntryHarness(entry);
+    await harness.experimental_call("install", null);
+    await flush();
+    expect(processes[0]).toMatchObject({ command: "/Users/test/.local/bin/cua-driver", args: ["stop"] });
+    processes[0]!.child.exit(0);
+    await flush();
+    expect(processes[1]).toMatchObject({ command: "/bin/bash", args: [written[0]!.path] });
+    processes[1]!.child.exit(0);
+    await flush();
+    expect(processes[2]).toMatchObject({ command: "open", args: ["-n", "-g", "-a", "CuaDriver", "--args", "serve"] });
+    processes[2]!.child.exit(0);
+    await flush();
+    expect(await harness.experimental_call("installState", null)).toMatchObject({ ok: true, step: "done" });
     await harness.experimental_dispose();
   });
 

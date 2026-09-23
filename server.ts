@@ -1,6 +1,14 @@
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { CATALOG, CATALOG_BY_NAME, toolNamesForGroups, type ToolGroup } from "./src/catalog.js";
+import {
+  CATALOG,
+  CATALOG_BY_NAME,
+  PLUGIN_MANAGED_ARGUMENTS,
+  overridableSchema,
+  toolNamesForGroups,
+  type CatalogEntry,
+  type ToolGroup,
+} from "./src/catalog.js";
 import {
   IDLE_INSTALL_STATE,
   catalogToolSchema,
@@ -8,6 +16,7 @@ import {
   hostContract,
   hostSignals,
   installStateSchema,
+  type DriverGrant,
   type DriverStatus,
   type InstallState,
   type ToolCallResult,
@@ -24,6 +33,7 @@ import {
   type RoutingMode,
   type RoutingPolicy,
 } from "./src/policy.js";
+import { UPSTREAM_DRIVER_VERSION } from "./src/upstream-schemas.generated.js";
 
 const OVERRIDES_KEY = "policy-overrides";
 const STATUS_KEY_PREFIX = "driver-status:";
@@ -109,6 +119,7 @@ interface SettingsSnapshot {
   browserTools: boolean;
   clipboardTools: boolean;
   passthroughTools: boolean;
+  signedInBrowserProfiles: boolean;
   sessionPrefix: string;
 }
 
@@ -142,6 +153,9 @@ function readinessLine(status: DriverStatus | null): string {
     );
   }
   if (status.daemonRunning === false) parts.push("The driver service was not running at last check; the first call starts it on demand.");
+  if (status.updateAvailable === true && status.latestVersion !== null) {
+    parts.push(`Cua Driver ${status.latestVersion} is available; tell the user they can update from ${SETTINGS_PATH} or with \`bb cua update --yes\`.`);
+  }
   return parts.join(" ");
 }
 
@@ -170,6 +184,46 @@ function toolResultText(result: ToolCallResult): string {
   } catch {
     return content;
   }
+}
+
+/**
+ * What reaches Cua Driver. Meta tools validate their own small schemas; every
+ * upstream tool forwards the agent's object untouched (minus arguments the
+ * plugin owns), so Cua Driver is the single validator of its own API.
+ */
+export function forwardableArguments(
+  entry: CatalogEntry,
+  raw: unknown,
+): { ok: true; value: Record<string, unknown> } | { ok: false; error: string } {
+  if (entry.parameters !== null) {
+    const parsed = entry.parameters.safeParse(raw ?? {});
+    if (!parsed.success) {
+      return {
+        ok: false,
+        error: `Invalid arguments for ${entry.name}: ${parsed.error.issues.map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`).join("; ")}`,
+      };
+    }
+    return { ok: true, value: parsed.data as Record<string, unknown> };
+  }
+  if (raw === undefined || raw === null) return { ok: true, value: {} };
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    return { ok: false, error: `Arguments for ${entry.name} must be a JSON object.` };
+  }
+  const value: Record<string, unknown> = { ...(raw as Record<string, unknown>) };
+  for (const key of PLUGIN_MANAGED_ARGUMENTS) delete value[key];
+  return { ok: true, value };
+}
+
+/** True when a browser_prepare call asks to attach to a person's own signed-in profile. */
+export function requestsExistingProfile(tool: string, args: Readonly<Record<string, unknown>>): boolean {
+  if (tool !== "browser_prepare") return false;
+  const strategy = args.strategy;
+  return typeof strategy === "object" && strategy !== null && (strategy as { kind?: unknown }).kind === "existing_profile";
+}
+
+/** Cua Driver ends a session with its transport; reusing the label is then refused. */
+export function isEndedSessionFailure(result: ToolCallResult): boolean {
+  return result.isError && /session '[^']*' has ended/i.test(toolResultText(result));
 }
 
 function isPermissionFailure(result: ToolCallResult): boolean {
@@ -207,6 +261,13 @@ export default async function plugin(bb: BbPluginApi) {
       description: "Expose cua_call and cua_describe so agents can reach every upstream tool, including recording and cursor themes.",
       default: true,
     },
+    signedInBrowserProfiles: {
+      type: "boolean",
+      label: "Signed-in browser profiles",
+      description:
+        "Let browser tools attach to an existing, signed-in Chrome or Edge window. On macOS this restarts Cua Driver with --grant existing-profile. Turning it off blocks those attaches at once; the running service keeps the grant until it restarts (cua-driver stop).",
+      default: false,
+    },
     sessionPrefix: {
       type: "string",
       label: "Session label prefix",
@@ -220,6 +281,7 @@ export default async function plugin(bb: BbPluginApi) {
     browserTools: boolean;
     clipboardTools: boolean;
     passthroughTools: boolean;
+    signedInBrowserProfiles: boolean;
     sessionPrefix: string;
   }): SettingsSnapshot {
     return {
@@ -227,6 +289,7 @@ export default async function plugin(bb: BbPluginApi) {
       browserTools: values.browserTools,
       clipboardTools: values.clipboardTools,
       passthroughTools: values.passthroughTools,
+      signedInBrowserProfiles: values.signedInBrowserProfiles,
       sessionPrefix: values.sessionPrefix.trim().length > 0 ? values.sessionPrefix.trim() : "bb",
     };
   }
@@ -248,6 +311,37 @@ export default async function plugin(bb: BbPluginApi) {
   const activeSessions = new Map<string, { hostId: string; label: string }>();
   const sessionEpoch = Date.now().toString(36);
   let sessionCounter = 0;
+  /** tools/list as each machine reported it, keyed by host, for per-session schemas. */
+  const liveSchemas = new Map<string, { version: string | null; schemas: Map<string, Record<string, unknown>> }>();
+
+  function grants(): DriverGrant[] {
+    return snapshot.signedInBrowserProfiles ? ["existing-profile"] : [];
+  }
+
+  /** A dropped connection ended every session it carried; mint new labels next time. */
+  function forgetHostSessions(hostId: string): void {
+    for (const [threadId, session] of activeSessions) {
+      if (session.hostId === hostId) activeSessions.delete(threadId);
+    }
+  }
+
+  function rememberSchemas(hostId: string, tools: ReadonlyArray<{ name: string; inputSchema: Record<string, unknown> }>): void {
+    liveSchemas.set(hostId, {
+      version: statusCache.get(hostId)?.version ?? null,
+      schemas: new Map(
+        tools.flatMap((tool) => {
+          const schema = overridableSchema(tool.inputSchema);
+          return schema === null ? [] : [[tool.name, schema] as const];
+        }),
+      ),
+    });
+  }
+
+  async function listHostTools(hostId: string, signal?: AbortSignal) {
+    const result = await host.call("listTools", { grants: grants() }, { hostId, ...(signal ? { signal } : {}) });
+    rememberSchemas(hostId, result.tools);
+    return result;
+  }
 
   for (const key of await bb.storage.kv.list(STATUS_KEY_PREFIX)) {
     const parsed = driverStatusSchema.safeParse(await bb.storage.kv.get<unknown>(key));
@@ -257,6 +351,7 @@ export default async function plugin(bb: BbPluginApi) {
   const host = bb.hosts.experimental_client({ contract: hostContract, experimental_signals: hostSignals });
 
   host.experimental_onSignal("connectionChanged", ({ hostId, payload }) => {
+    if (!payload.connected) forgetHostSessions(hostId);
     const cached = statusCache.get(hostId);
     if (cached !== undefined) {
       const next = { ...cached, connected: payload.connected };
@@ -277,6 +372,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
   });
   host.experimental_onWorkerExit(({ hostId }) => {
+    forgetHostSessions(hostId);
     const cached = statusCache.get(hostId);
     if (cached !== undefined) statusCache.set(hostId, { ...cached, connected: false });
     const install = installByHost.get(hostId);
@@ -341,28 +437,34 @@ export default async function plugin(bb: BbPluginApi) {
     return connected.id;
   }
 
+  function sessionFor(threadId: string, hostId: string): string {
+    const active = activeSessions.get(threadId);
+    if (active?.hostId === hostId) return active.label;
+    sessionCounter += 1;
+    const label = sessionLabel(snapshot.sessionPrefix, `${threadId}-${sessionEpoch}-${sessionCounter.toString(36)}`);
+    activeSessions.set(threadId, { hostId, label });
+    return label;
+  }
+
   async function callDriver(
     hostId: string,
     name: string,
     args: Record<string, unknown>,
     options: { threadId?: string; signal?: AbortSignal },
   ): Promise<ToolCallResult> {
-    let label: string | undefined;
-    if (options.threadId !== undefined) {
-      const active = activeSessions.get(options.threadId);
-      if (active?.hostId === hostId) {
-        label = active.label;
-      } else {
-        sessionCounter += 1;
-        label = sessionLabel(snapshot.sessionPrefix, `${options.threadId}-${sessionEpoch}-${sessionCounter.toString(36)}`);
-        activeSessions.set(options.threadId, { hostId, label });
-      }
-    }
-    return host.call(
-      "callTool",
-      { name, arguments: args, ...(label === undefined ? {} : { session: label }) },
-      { hostId, ...(options.signal ? { signal: options.signal } : {}) },
-    );
+    const send = (label: string | undefined) =>
+      host.call(
+        "callTool",
+        { name, arguments: args, grants: grants(), ...(label === undefined ? {} : { session: label }) },
+        { hostId, ...(options.signal ? { signal: options.signal } : {}) },
+      );
+    if (options.threadId === undefined) return send(undefined);
+    const result = await send(sessionFor(options.threadId, hostId));
+    if (!isEndedSessionFailure(result)) return result;
+    // The driver ended this thread's session (for example after an idle
+    // disconnect); a fresh label starts a new one. Retry exactly once.
+    activeSessions.delete(options.threadId);
+    return send(sessionFor(options.threadId, hostId));
   }
 
   function failure(text: string): ToolCallResult {
@@ -382,6 +484,11 @@ export default async function plugin(bb: BbPluginApi) {
     args: Record<string, unknown>,
     options: { threadId?: string; signal?: AbortSignal },
   ): Promise<ToolCallResult> {
+    if (!snapshot.signedInBrowserProfiles && requestsExistingProfile(name, args)) {
+      return failure(
+        `Attaching to a signed-in browser profile is turned off. Ask the user to turn on **Signed-in browser profiles** in [Computer Use settings](${SETTINGS_PATH}) if they want this, or work in a separate browser.`,
+      );
+    }
     const status = await statusForTool(hostId, options.signal);
     const guidance = setupGuidance(status, hostId);
     if (guidance !== null) return failure(guidance);
@@ -419,7 +526,7 @@ export default async function plugin(bb: BbPluginApi) {
         return { content: [{ type: "text", text: `${readinessLine(status)}\n\n${JSON.stringify(status, null, 2)}` }], isError: false };
       }
       if (entry.name === "cua_describe") {
-        const { tools } = await host.call("listTools", null, { hostId, signal: context.signal });
+        const { tools } = await listHostTools(hostId, context.signal);
         const wanted = typeof args.tool === "string" ? args.tool : null;
         if (wanted === null) {
           return {
@@ -438,7 +545,14 @@ export default async function plugin(bb: BbPluginApi) {
         return await callConfiguredDriver(hostId, upstream, forwarded, context);
       }
       if (entry.upstream === null) return failure(`Tool ${toolName} has no upstream mapping.`);
-      return await callConfiguredDriver(hostId, entry.upstream, args, context);
+      const result = await callConfiguredDriver(hostId, entry.upstream, args, context);
+      const version = statusCache.get(hostId)?.version ?? null;
+      if (version !== null && version !== UPSTREAM_DRIVER_VERSION && liveSchemas.get(hostId)?.version !== version) {
+        void listHostTools(hostId).catch((error: unknown) =>
+          bb.log.debug(`reading tools/list from ${hostId} failed: ${errorMessage(error)}`),
+        );
+      }
+      return result;
     } catch (error) {
       const message = errorMessage(error);
       bb.log.warn(`${toolName} failed on host ${hostId}: ${message}`);
@@ -452,16 +566,29 @@ export default async function plugin(bb: BbPluginApi) {
     bb.agents.registerTool({
       name: entry.name,
       description: entry.description,
-      parameters: z.toJSONSchema(entry.parameters, { io: "input" }),
+      parameters: entry.inputSchema,
       presentation: { label: entry.labels },
       async execute(rawArgs, context) {
-        const parsed = entry.parameters.safeParse(rawArgs ?? {});
-        if (!parsed.success) {
-          return failure(`Invalid arguments for ${entry.name}: ${parsed.error.issues.map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`).join("; ")}`);
-        }
-        return executeCatalogTool(entry.name, parsed.data as Record<string, unknown>, context);
+        const args = forwardableArguments(entry, rawArgs);
+        if (!args.ok) return failure(args.error);
+        return executeCatalogTool(entry.name, args.value, context);
       },
     });
+  }
+
+  /**
+   * The schema a provider sees for one tool on one machine: the bundled
+   * snapshot while the machine runs the version it was taken from, otherwise
+   * that machine's own tools/list once it has been read.
+   */
+  function toolSelection(name: string, hostId: string): string | { name: string; parameters: Record<string, unknown> } {
+    const entry = CATALOG_BY_NAME.get(name);
+    if (entry === undefined || entry.upstream === null) return name;
+    const version = statusCache.get(hostId)?.version ?? null;
+    if (version === null || version === UPSTREAM_DRIVER_VERSION) return name;
+    const live = liveSchemas.get(hostId);
+    const schema = live?.version === version ? live.schemas.get(entry.upstream) : undefined;
+    return schema === undefined ? name : { name, parameters: schema };
   }
 
   bb.agents.configure((context) => {
@@ -469,7 +596,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (decision !== "cua") return { tools: [], skills: [] };
     const status = statusCache.get(context.host.id) ?? null;
     return {
-      tools: enabledToolNames(),
+      tools: enabledToolNames().map((name) => toolSelection(name, context.host.id)),
       skills: [SKILL_NAME],
       instructions: [
         `Cua Driver computer use is available on ${context.host.name} through the cua_* tools.`,
@@ -536,7 +663,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
     refreshStatus: ({ hostId }) => refreshStatus(hostId, true),
     async listTools({ hostId }) {
-      return host.call("listTools", null, { hostId });
+      return listHostTools(hostId);
     },
     installDriver: ({ hostId }) => startInstall(hostId),
     installState: ({ hostId }) => readInstallState(hostId),
@@ -575,6 +702,7 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb cua tools [--host <id>]                   Upstream tool catalog",
     "  bb cua call <tool> [<json-args>] [--host <id>]",
     "  bb cua install --yes [--host <id>]           Run Cua's official installer on a machine",
+    "  bb cua update --yes [--host <id>]            Update Cua Driver to the newest release on its channel",
     "  bb cua grant [--host <id>]                   Request macOS Accessibility + Screen Recording",
   ].join("\n");
 
@@ -588,6 +716,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "tools", summary: "List the upstream Cua Driver tool catalog", usage: "bb cua tools [--host <id>]" },
       { name: "call", summary: "Call any Cua Driver tool with JSON arguments", usage: "bb cua call <tool> [<json-args>] [--host <id>]" },
       { name: "install", summary: "Run Cua's official installer on a machine (requires --yes)", usage: "bb cua install --yes [--host <id>]" },
+      { name: "update", summary: "Update Cua Driver to the newest release on its channel (requires --yes)", usage: "bb cua update --yes [--host <id>]" },
       { name: "grant", summary: "Request macOS Accessibility and Screen Recording for CuaDriver.app", usage: "bb cua grant [--host <id>]" },
     ],
     async run(argv, ctx) {
@@ -635,7 +764,7 @@ export default async function plugin(bb: BbPluginApi) {
           return { exitCode: 0, stdout: `mode: ${mode}` };
         }
         if (command === "tools") {
-          const { tools } = await host.call("listTools", null, { hostId: await targetHost() });
+          const { tools } = await listHostTools(await targetHost());
           return {
             exitCode: 0,
             stdout: json ? JSON.stringify(tools) : tools.map((tool) => `${tool.name}: ${tool.description.split("\n")[0] ?? ""}`).join("\n"),
@@ -663,7 +792,26 @@ export default async function plugin(bb: BbPluginApi) {
             .join("\n");
           return { exitCode: result.isError ? 1 : 0, stdout: json ? JSON.stringify(result) : text };
         }
-        if (command === "install") {
+        if (command === "update") {
+          const hostId = await targetHost();
+          const status = await refreshStatus(hostId, true);
+          if (!status.installed) return { exitCode: 1, stderr: "Cua Driver is not installed on that machine; run `bb cua install --yes` first." };
+          if (status.updateAvailable !== true) {
+            return {
+              exitCode: 0,
+              stdout: status.updateAvailable === false
+                ? `Cua Driver ${status.version ?? ""} is already the newest release.`
+                : "Could not check for a newer Cua Driver release; try again later.",
+            };
+          }
+          if (!yes) {
+            return {
+              exitCode: 1,
+              stderr: `This stops Cua Driver ${status.version ?? ""} and runs Cua's official installer to install ${status.latestVersion ?? "the newest release"}. Re-run with --yes to confirm.`,
+            };
+          }
+        }
+        if (command === "install" || command === "update") {
           if (!yes) {
             return {
               exitCode: 1,
@@ -705,7 +853,11 @@ export default async function plugin(bb: BbPluginApi) {
     if (active === undefined) return;
     activeSessions.delete(threadId);
     void host
-      .call("callTool", { name: "end_session", arguments: { session: active.label } }, { hostId: active.hostId })
+      .call(
+        "callTool",
+        { name: "end_session", arguments: { session: active.label }, grants: grants() },
+        { hostId: active.hostId },
+      )
       .catch((error: unknown) => bb.log.debug(`end_session for ${threadId} failed: ${errorMessage(error)}`));
   }
   bb.events.on("thread.idle", ({ thread }) => endSession(thread.id));

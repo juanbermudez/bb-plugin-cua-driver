@@ -263,6 +263,28 @@ describe("settings sections", () => {
     slot.lifecycle.unmount();
   });
 
+  it("offers an update when a ready machine runs an older Cua Driver", async () => {
+    const app = await loadPluginApp(() => import("./app"));
+    const section = app.settingsSections.find((candidate) => candidate.id === "driver-machines")!;
+    const [laptop] = baseState.hosts;
+    const outdated = {
+      ...laptop!,
+      driver: {
+        ...laptop!.driver,
+        permissions: { accessibility: true, screenRecording: true, directCapture: "not_checked" },
+        latestVersion: "0.28.2",
+        updateAvailable: true,
+      },
+    };
+    const slot = renderSlot(section, {}, { rpc: { getState: () => ({ ...baseState, hosts: [outdated] }) } });
+
+    const machine = await slot.findByRole("button", { name: /^laptop setup/ });
+    if (machine.getAttribute("aria-expanded") !== "true") fireEvent.click(machine);
+    expect(await slot.findByText("v0.23.2 · v0.28.2 available")).toBeTruthy();
+    expect(await slot.findByRole("button", { name: "Update to v0.28.2…" })).toBeTruthy();
+    slot.lifecycle.unmount();
+  });
+
   it("keeps offline machines inert and hides stale setup failures", async () => {
     const app = await loadPluginApp(() => import("./app"));
     const section = app.settingsSections.find((candidate) => candidate.id === "driver-machines")!;

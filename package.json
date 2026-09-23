@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-cua-driver",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "engines": {
     "bb": ">=0.39",
@@ -63,6 +63,8 @@
     "build": "bb plugin build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "check": "npm run typecheck && npm run test && npm run build"
+    "check": "npm run typecheck && npm run test && npm run build",
+    "sync:schemas": "node scripts/sync-upstream-schemas.mjs",
+    "test:live": "CUA_LIVE=1 vitest run live.test.ts"
   }
 }

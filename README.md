@@ -17,10 +17,10 @@ Inc. or the bb team. See [NOTICE.md](NOTICE.md) for attribution.
 
 | Surface | Details |
 | --- | --- |
-| Agent tools | 30 tools: 20 desktop (`cua_list_apps`, `cua_launch_app`, `cua_get_window_state`, `cua_click`, `cua_type_text`, `cua_press_key`, `cua_hotkey`, `cua_scroll`, `cua_drag`, `cua_set_value`, `cua_invoke_menu`, `cua_verify_state`, `cua_set_window_frame`, `cua_bring_to_front`, `cua_zoom`, ...), 7 browser, 2 clipboard, and 3 meta (`cua_call` for any upstream tool, `cua_describe`, `cua_status`). Screenshots come back as images the model can see. |
+| Agent tools | 35 tools: 21 desktop (`cua_list_apps`, `cua_launch_app`, `cua_get_window_state`, `cua_get_accessibility_tree`, `cua_click`, `cua_type_text`, `cua_press_key`, `cua_hotkey`, `cua_scroll`, `cua_drag`, `cua_set_value`, `cua_invoke_menu`, `cua_verify_state`, `cua_set_window_frame`, `cua_bring_to_front`, `cua_zoom`, ...), 9 browser (including `cua_browser_download` and `cua_browser_set_input_files`), 2 clipboard, and 3 meta (`cua_call` for any upstream tool, `cua_describe`, `cua_status`). Each tool advertises Cua Driver's own input schema and forwards arguments untouched. Screenshots come back as images the model can see. |
 | Agent skill | `cua-computer-use`, adapted from the upstream Cua Driver skill: snapshot-before-action, verify-after, the escalation ladder, and the pitfalls list. |
 | Settings UI | Routing mode, per-provider overrides, an expandable setup checklist for every machine, guided install and permission actions, tool-group toggles. |
-| CLI | `bb cua status`, `bb cua policy`, `bb cua mode`, `bb cua tools`, `bb cua call`. |
+| CLI | `bb cua status`, `bb cua policy`, `bb cua mode`, `bb cua tools`, `bb cua call`, `bb cua install`, `bb cua update`, `bb cua grant`. |
 | Multi-machine | Tool calls run on the host that owns the thread's environment through bb's host RPC, so remote enrolled machines work the same as the local one. |
 
 ## Requirements
@@ -63,6 +63,39 @@ From a checkout:
 npm install
 bb plugin install .
 ```
+
+## Staying current with Cua Driver
+
+Tool schemas come from Cua Driver itself. `src/upstream-schemas.generated.ts`
+is a snapshot of `tools/list` (tested against Cua Driver 0.28.2); regenerate it
+after updating the driver and review the diff:
+
+```sh
+npm run sync:schemas
+```
+
+Arguments are forwarded untouched, so a newer driver's parameters work before
+the snapshot is refreshed, and a machine whose driver version differs from the
+snapshot advertises its own `tools/list` to agents once it has been read.
+
+When a newer release exists, the machine's checklist offers **Update to
+vX…**, `cua_status` says so, and `bb cua update --yes` stops the driver, runs
+Cua's official installer, and starts it again.
+
+## Signed-in browser profiles
+
+Cua Driver 0.28 treats any Chrome or Edge window with a real profile as a
+person's signed-in profile: reading it needs the driver service started with
+`--grant existing-profile`. Turn on **Signed-in browser profiles** in the plugin
+settings to allow it. The plugin then restarts the service on macOS with that
+grant (through LaunchServices, so it keeps CuaDriver.app's permissions) and
+agents attach with `cua_browser_prepare({pid, window_id, strategy: {kind:
+"existing_profile"}})`. With the setting off, the plugin refuses that attach
+itself. Turning the setting off blocks those attaches at once, but the running
+service keeps the grant until it restarts: run `cua-driver stop` to drop it
+now. The plugin never removes a grant itself, since someone else may have
+started the service that way. On Linux and Windows, start
+`cua-driver serve --grant existing-profile` yourself.
 
 ## Configure
 

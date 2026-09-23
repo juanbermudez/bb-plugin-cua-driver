@@ -38,6 +38,9 @@ export const driverStatusSchema = z
       .strict()
       .nullable(),
     connected: z.boolean(),
+    /** Newest release on the machine's saved channel; null when the check could not run. */
+    latestVersion: z.string().nullable(),
+    updateAvailable: z.boolean().nullable(),
     toolCount: z.number().int().nullable(),
     error: z.string().nullable(),
     checkedAt: z.string(),
@@ -77,6 +80,14 @@ export const IDLE_INSTALL_STATE: InstallState = {
   finishedAt: null,
 };
 
+/**
+ * Opt-in Cua Driver grants the MCP server is started with. `existing-profile`
+ * lets browser tools attach to a person's signed-in Chrome or Edge profile.
+ */
+export const DRIVER_GRANTS = ["existing-profile"] as const;
+export const driverGrantsSchema = z.array(z.enum(DRIVER_GRANTS)).max(DRIVER_GRANTS.length);
+export type DriverGrant = (typeof DRIVER_GRANTS)[number];
+
 export const hostContract = defineRpcContract({
   install: {
     input: z.null(),
@@ -95,7 +106,7 @@ export const hostContract = defineRpcContract({
     output: driverStatusSchema,
   },
   listTools: {
-    input: z.null(),
+    input: z.object({ grants: driverGrantsSchema }).strict(),
     output: z.object({ tools: z.array(catalogToolSchema) }).strict(),
   },
   callTool: {
@@ -104,6 +115,7 @@ export const hostContract = defineRpcContract({
         name: z.string().min(1),
         arguments: z.record(z.string(), z.unknown()),
         session: z.string().min(1).max(125).optional(),
+        grants: driverGrantsSchema,
       })
       .strict(),
     output: toolCallResultSchema,
