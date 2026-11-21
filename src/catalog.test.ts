@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CATALOG, CATALOG_BY_NAME, overridableSchema, toolNamesForGroups } from "./catalog.js";
+import { CATALOG, CATALOG_BY_NAME, overridableSchema, sanitizeProviderSchema, toolNamesForGroups } from "./catalog.js";
 import { UPSTREAM_SCHEMAS } from "./upstream-schemas.generated.js";
 
 function propertyNames(schema: Record<string, unknown>): string[] {
@@ -67,5 +67,119 @@ describe("catalog", () => {
 
     const huge = { type: "object", properties: { pid: { type: "integer", description: "x".repeat(130 * 1024) } } };
     expect(overridableSchema(huge)).toBeNull();
+  });
+
+  it("normalizes schemas recursively for Gemini provider compatibility", () => {
+    // 1. Non-string enum member (e.g. boolean [true]) is dropped; empty enum is omitted
+    const booleanEnumSchema = {
+      type: "object",
+      properties: {
+        element: {
+          type: "object",
+          properties: {
+            exists: {
+              type: "boolean",
+              description: "Assert element exists",
+              enum: [true],
+            },
+          },
+        },
+      },
+    };
+    const sanitizedBoolean = sanitizeProviderSchema(booleanEnumSchema) as Record<string, unknown>;
+    const existsProp = ((sanitizedBoolean.properties as Record<string, unknown>).element as Record<string, unknown>)
+      .properties as Record<string, Record<string, unknown>>;
+    expect(existsProp.exists.type).toBe("boolean");
+    expect(existsProp.exists.enum).toBeUndefined();
+
+    // 2. Empty string / whitespace-only enum members are dropped while valid strings are kept
+    const mixedEnumSchema = {
+      type: "object",
+      properties: {
+        mode: {
+          type: "string",
+          enum: ["", "fast", "  ", "slow"],
+        },
+      },
+    };
+    const sanitizedMixed = sanitizeProviderSchema(mixedEnumSchema) as Record<string, unknown>;
+    const modeProp = (sanitizedMixed.properties as Record<string, Record<string, unknown>>).mode;
+    expect(modeProp.enum).toEqual(["fast", "slow"]);
+
+    // 3. Enum containing only empty/invalid strings is omitted
+    const emptyStringEnumSchema = {
+      type: "object",
+      properties: {
+        flag: {
+          type: "string",
+          enum: ["", "  "],
+        },
+      },
+    };
+    const sanitizedEmpty = sanitizeProviderSchema(emptyStringEnumSchema) as Record<string, unknown>;
+    const flagProp = (sanitizedEmpty.properties as Record<string, Record<string, unknown>>).flag;
+    expect(flagProp.enum).toBeUndefined();
+
+    // 4. Standard valid string enum is preserved
+    const validStringEnumSchema = {
+      type: "object",
+      properties: {
+        button: {
+          type: "string",
+          enum: ["left", "right", "middle"],
+        },
+      },
+    };
+    const sanitizedValid = sanitizeProviderSchema(validStringEnumSchema) as Record<string, unknown>;
+    const buttonProp = (sanitizedValid.properties as Record<string, Record<string, unknown>>).button;
+    expect(buttonProp.enum).toEqual(["left", "right", "middle"]);
+  });
+
+  it("ensures cua_verify_state advertised schema has no invalid enum on exists while bundled snapshot is preserved", () => {
+    // Bundled snapshot retains original upstream schema unchanged
+    const rawVerifyState = UPSTREAM_SCHEMAS.verify_state as Record<string, any>;
+    const rawExists = rawVerifyState?.properties?.expect?.items?.properties?.element?.properties?.exists;
+    expect(rawExists?.enum).toEqual([true]);
+
+    // Advertised catalog schema has invalid boolean enum stripped for provider safety
+    const catalogVerifyState = CATALOG_BY_NAME.get("cua_verify_state");
+    expect(catalogVerifyState).toBeDefined();
+    const advertisedExists = (catalogVerifyState?.inputSchema as any)?.properties?.expect?.items?.properties?.element?.properties?.exists;
+    expect(advertisedExists?.type).toBe("boolean");
+    expect(advertisedExists?.enum).toBeUndefined();
+  });
+
+  it("sanitizes live schema overrides with invalid enums through overridableSchema", () => {
+    const liveBadSchema = {
+      type: "object",
+      properties: {
+        session: { type: "string" },
+        expect: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              element: {
+                type: "object",
+                properties: {
+                  exists: {
+                    type: "boolean",
+                    enum: [true],
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      required: ["session", "expect"],
+    };
+
+    const sanitized = overridableSchema(liveBadSchema) as any;
+    expect(sanitized).not.toBeNull();
+    expect(sanitized.properties.session).toBeUndefined();
+    expect(sanitized.required).toEqual(["expect"]);
+    expect(sanitized.properties.expect.items.properties.element.properties.exists.enum).toBeUndefined();
+    expect(sanitized.properties.expect.items.properties.element.properties.exists.type).toBe("boolean");
   });
 });
