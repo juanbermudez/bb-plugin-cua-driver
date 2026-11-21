@@ -29,7 +29,42 @@ export interface CatalogEntry {
   labels: { pending: string; completed: string };
 }
 
-/** Cua Driver's schema as agents should see it: without the arguments the plugin owns. */
+/**
+ * Recursively normalizes a JSON Schema for LLM provider compatibility (e.g. Gemini).
+ *
+ * Gemini's FunctionDeclaration schema rejects:
+ * - Empty string enum members (`enum[0]: cannot be empty`)
+ * - Non-string enum members (e.g. boolean `[true]` or numbers)
+ * - Empty enum arrays (`enum: []`)
+ *
+ * This normalizer preserves valid semantics while sanitizing provider-facing schemas:
+ * - Drops non-string or whitespace-only enum values
+ * - If no valid enum values remain, omits the `enum` constraint entirely
+ * - Recurses through nested objects, arrays, and schema combinators
+ */
+export function sanitizeProviderSchema(value: unknown): unknown {
+  if (value === null || typeof value !== "object") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map(sanitizeProviderSchema);
+  }
+  const obj = value as Record<string, unknown>;
+  const result: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(obj)) {
+    if (key === "enum" && Array.isArray(child)) {
+      const valid = child.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
+      if (valid.length > 0) {
+        result.enum = valid;
+      }
+    } else {
+      result[key] = sanitizeProviderSchema(child);
+    }
+  }
+  return result;
+}
+
+/** Cua Driver's schema as agents should see it: without the arguments the plugin owns, sanitized for provider compatibility. */
 export function advertisedSchema(schema: Readonly<Record<string, unknown>>): Record<string, unknown> {
   const properties =
     typeof schema.properties === "object" && schema.properties !== null
@@ -42,7 +77,7 @@ export function advertisedSchema(schema: Readonly<Record<string, unknown>>): Rec
   const next: Record<string, unknown> = { ...schema, type: "object", properties };
   if (required.length > 0) next.required = required;
   else delete next.required;
-  return next;
+  return sanitizeProviderSchema(next) as Record<string, unknown>;
 }
 
 /** bb's cap on a schema that configure() returns for one tool. */
