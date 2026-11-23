@@ -82,6 +82,6 @@ bb cua status [--host <id>] [--json]
 bb cua mode <prefer-native|cua-everywhere|off>
 bb cua policy [<providerId> <cua|native|off|inherit>] [--json]
 bb cua tools [--host <id>]
-bb cua call <tool> [<json-args>] [--host <id>]
+bb cua call <tool> [<json-args>|--file <args.json>|@<path>|--base64 <json>] [--host <id>]
 bb plugin config cua-driver set browserTools false
 ```

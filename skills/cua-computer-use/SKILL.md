@@ -80,8 +80,12 @@ from `refs` in a `snapshot_format: "semantic_v2"` read, narrowed with `query`.
   busy; re-snapshot and retry once.
 - Sessions are managed for you: every call in this thread shares one Cua
   session, renewed automatically if the driver ended it.
-- Long tail tools (recording, cursor themes, sessions, `page`) are reachable
-  through `cua_call {tool, arguments}`; read the schema with `cua_describe`.
+- Long tail tools (recording, cursor themes, sessions, `page`, `run_steps`) are
+  reachable through `cua_call {tool, arguments}`; read the schema with
+  `cua_describe`. Prefer that over `bb cua call` for nested JSON: on Windows,
+  `cmd.exe` can strip quotes from inline JSON in argv. If a CLI call is needed,
+  write the object to a file and use `bb cua call <tool> --file <path>` (or
+  `@<path>`, or `--base64 <json>`).
 
 ## Things to avoid
 

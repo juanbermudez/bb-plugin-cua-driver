@@ -1,3 +1,5 @@
+import { readFile } from "node:fs/promises";
+import { isAbsolute, resolve } from "node:path";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import {
@@ -125,6 +127,52 @@ interface SettingsSnapshot {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+const CLI_VALUE_FLAGS = ["--host", "--file", "--args-file", "--base64"] as const;
+type CliValueFlag = (typeof CLI_VALUE_FLAGS)[number];
+const CLI_BOOLEAN_FLAGS = new Set(["--json", "--yes", "--stdin"]);
+
+interface ParsedCliArgv {
+  readonly flags: Partial<Record<CliValueFlag, string>>;
+  readonly booleans: ReadonlySet<string>;
+  readonly positional: string[];
+  readonly error?: string;
+}
+
+function parseCliArgv(argv: readonly string[]): ParsedCliArgv {
+  const flags: Partial<Record<CliValueFlag, string>> = {};
+  const booleans = new Set<string>();
+  const positional: string[] = [];
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index]!;
+    if ((CLI_VALUE_FLAGS as readonly string[]).includes(arg)) {
+      const value = argv[index + 1];
+      if (value === undefined || value.startsWith("--")) {
+        return { flags, booleans, positional, error: `${arg} needs a value.` };
+      }
+      flags[arg as CliValueFlag] = value;
+      index += 1;
+    } else if (CLI_BOOLEAN_FLAGS.has(arg)) {
+      booleans.add(arg);
+    } else {
+      positional.push(arg);
+    }
+  }
+  return { flags, booleans, positional };
+}
+
+function parseJsonArguments(text: string): Record<string, unknown> | string {
+  let value: unknown;
+  try {
+    value = JSON.parse(text.replace(/^\uFEFF/, ""));
+  } catch (error) {
+    return `Invalid JSON arguments: ${errorMessage(error)}. On Windows, cmd.exe can strip quotes from inline JSON; write the object to a file and pass --file <path> or @<path>.`;
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return "Arguments must be a JSON object.";
+  }
+  return value as Record<string, unknown>;
 }
 
 function sessionLabel(prefix: string, threadId: string): string {
@@ -701,6 +749,7 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb cua mode <prefer-native|cua-everywhere|off>",
     "  bb cua tools [--host <id>]                   Upstream tool catalog",
     "  bb cua call <tool> [<json-args>] [--host <id>]",
+    "  bb cua call <tool> --file <args.json> [--host <id>]   Quote-safe JSON (also @<path> or --base64 <json>)",
     "  bb cua install --yes [--host <id>]           Run Cua's official installer on a machine",
     "  bb cua update --yes [--host <id>]            Update Cua Driver to the newest release on its channel",
     "  bb cua grant [--host <id>]                   Request macOS Accessibility + Screen Recording",
@@ -714,21 +763,18 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "policy", summary: "Show or set per-provider routing overrides", usage: "bb cua policy [<providerId> <cua|native|off|inherit>] [--json]" },
       { name: "mode", summary: "Set the routing mode", usage: "bb cua mode <prefer-native|cua-everywhere|off>" },
       { name: "tools", summary: "List the upstream Cua Driver tool catalog", usage: "bb cua tools [--host <id>]" },
-      { name: "call", summary: "Call any Cua Driver tool with JSON arguments", usage: "bb cua call <tool> [<json-args>] [--host <id>]" },
+      { name: "call", summary: "Call any Cua Driver tool with JSON arguments (inline, --file, @path, or --base64)", usage: "bb cua call <tool> [<json-args>|--file <args.json>|@<path>|--base64 <json>] [--host <id>]" },
       { name: "install", summary: "Run Cua's official installer on a machine (requires --yes)", usage: "bb cua install --yes [--host <id>]" },
       { name: "update", summary: "Update Cua Driver to the newest release on its channel (requires --yes)", usage: "bb cua update --yes [--host <id>]" },
       { name: "grant", summary: "Request macOS Accessibility and Screen Recording for CuaDriver.app", usage: "bb cua grant [--host <id>]" },
     ],
     async run(argv, ctx) {
-      const json = argv.includes("--json");
-      const yes = argv.includes("--yes");
-      const hostFlag = argv.indexOf("--host");
-      const explicitHost = hostFlag >= 0 ? argv[hostFlag + 1] : undefined;
-      const args = argv.filter(
-        (arg, index) =>
-          arg !== "--json" && arg !== "--yes" && arg !== "--host" && (hostFlag < 0 || index !== hostFlag + 1),
-      );
-      const [command, ...rest] = args;
+      const parsed = parseCliArgv(argv);
+      if (parsed.error !== undefined) return { exitCode: 1, stderr: parsed.error };
+      const json = parsed.booleans.has("--json");
+      const yes = parsed.booleans.has("--yes");
+      const explicitHost = parsed.flags["--host"];
+      const [command, ...rest] = parsed.positional;
       async function targetHost(): Promise<string> {
         if (explicitHost !== undefined) return explicitHost;
         if (ctx.threadId !== undefined) return resolveHostId(ctx.threadId);
@@ -771,20 +817,61 @@ export default async function plugin(bb: BbPluginApi) {
           };
         }
         if (command === "call") {
-          const [tool, rawArgs] = rest;
+          const [tool, rawArgs, ...extra] = rest;
           if (tool === undefined) return { exitCode: 1, stderr: USAGE };
-          let parsed: Record<string, unknown> = {};
-          if (rawArgs !== undefined) {
-            const value: unknown = JSON.parse(rawArgs);
-            if (typeof value !== "object" || value === null || Array.isArray(value)) {
-              return { exitCode: 1, stderr: "Arguments must be a JSON object." };
+          if (extra.length > 0) {
+            return {
+              exitCode: 1,
+              stderr: `Unexpected argument ${extra[0]}. Pass arguments as one JSON object, --file <path>, @<path>, or --base64 <json>.`,
+            };
+          }
+          if (parsed.booleans.has("--stdin")) {
+            return {
+              exitCode: 1,
+              stderr:
+                "bb cua call cannot read stdin through the plugin CLI. Write the JSON to a file and use --file <path> or @<path>.",
+            };
+          }
+          const atPath = rawArgs?.startsWith("@") ? rawArgs.slice(1) : undefined;
+          const files = [parsed.flags["--file"], parsed.flags["--args-file"], atPath].filter(
+            (value): value is string => value !== undefined,
+          );
+          const filePath = files[0];
+          const encoded = parsed.flags["--base64"];
+          const inline = rawArgs !== undefined && atPath === undefined ? rawArgs : undefined;
+          const sources = [files.length > 0, encoded !== undefined, inline !== undefined].filter(Boolean).length;
+          if (sources > 1) {
+            return {
+              exitCode: 1,
+              stderr: "Pass arguments in one place only: inline JSON, --file <path>, @<path>, or --base64 <json>.",
+            };
+          }
+          let argumentsText: string | undefined;
+          if (filePath !== undefined) {
+            const path = isAbsolute(filePath) ? filePath : resolve(ctx.cwd ?? process.cwd(), filePath);
+            try {
+              argumentsText = await readFile(path, "utf8");
+            } catch (error) {
+              return { exitCode: 1, stderr: `Could not read arguments file ${path}: ${errorMessage(error)}` };
             }
-            parsed = value as Record<string, unknown>;
+          } else if (encoded !== undefined) {
+            if (encoded.trim() === "" || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) {
+              return { exitCode: 1, stderr: "--base64 expects a base64-encoded JSON object." };
+            }
+            argumentsText = Buffer.from(encoded, "base64").toString("utf8");
+          } else {
+            argumentsText = inline;
+          }
+          let argumentsObject: Record<string, unknown> = {};
+          if (argumentsText !== undefined && argumentsText.trim() !== "") {
+            const value = parseJsonArguments(argumentsText);
+            if (typeof value === "string") return { exitCode: 1, stderr: value };
+            argumentsObject = value;
           }
           const result = await callConfiguredDriver(
             await targetHost(),
             tool,
-            parsed,
+            argumentsObject,
             ctx.threadId === undefined ? {} : { threadId: ctx.threadId },
           );
           const text = result.content

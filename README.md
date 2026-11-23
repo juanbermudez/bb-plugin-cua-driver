@@ -23,6 +23,31 @@ Inc. or the bb team. See [NOTICE.md](NOTICE.md) for attribution.
 | CLI | `bb cua status`, `bb cua policy`, `bb cua mode`, `bb cua tools`, `bb cua call`, `bb cua install`, `bb cua update`, `bb cua grant`. |
 | Multi-machine | Tool calls run on the host that owns the thread's environment through bb's host RPC, so remote enrolled machines work the same as the local one. |
 
+### Quote-safe JSON for `bb cua call`
+
+On Windows, `bb.cmd` passes arguments through `cmd.exe`, which can strip quotes
+from inline JSON containing nested objects. Short flat payloads still work:
+
+```powershell
+bb cua call list_windows '{"pid":12664}'
+```
+
+For larger payloads such as `run_steps`, keep the JSON out of argv. Write it to
+a file and pass `--file` (or the `@path` shorthand), or pass base64:
+
+```powershell
+$json = Get-Content -Raw -LiteralPath steps.json
+bb cua call run_steps --file steps.json
+bb cua call run_steps @steps.json
+bb cua call run_steps --base64 ([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json)))
+```
+
+Relative paths resolve from the invoking CLI's cwd. An `--stdin` flag is not
+supported because plugin CLIs receive argv only, not the invoking process's
+stdin. In a bb thread, the `cua_call` agent tool takes an `arguments` object
+directly, so it never crosses `cmd.exe` and is the simplest route for complex
+payloads.
+
 ## Requirements
 
 - bb `>=0.39` with plugin SDK `>=0.4.16`.
