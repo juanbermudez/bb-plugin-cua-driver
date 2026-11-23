@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- `bb cua call` no longer depends on inline JSON surviving `cmd.exe`. Complex
+  arguments (for example `run_steps`) can be passed with `--file <path>`, the
+  `@<path>` shorthand, or `--base64 <json>`; relative paths resolve from the
+  invoking CLI's cwd. Inline JSON still works for short payloads, malformed
+  input now gets an actionable Windows-specific error, UTF-8 BOMs from
+  PowerShell-written files are ignored, and `--stdin` explains that plugin
+  CLIs cannot read the invoking process's stdin.
+
 ## 0.2.0
 
 Validated live against Cua Driver 0.28.2 on macOS (see `docs/TASKS.md`, M2).

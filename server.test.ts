@@ -1,3 +1,6 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import type { PluginAgentToolResult } from "@get-bb/plugin-sdk";
 import { describe, expect, it, vi } from "vitest";
@@ -408,5 +411,82 @@ describe("cua-driver server", () => {
     const grant = (await harness.behavior.callRpc("grantPermissions", { hostId: "host_9" })) as { ok: boolean };
     expect(grant.ok).toBe(true);
     expect(hostCalls.some((call) => call.method === "grantPermissions")).toBe(true);
+  });
+
+  describe("bb cua call arguments", () => {
+    const nested = {
+      steps: [{ tool: "click", arguments: { pid: 12664, label: 'a "quoted" label' } }],
+    };
+
+    it("reads nested JSON from --file without putting it in argv", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "cua-call-"));
+      try {
+        await writeFile(join(dir, "steps.json"), JSON.stringify(nested), "utf8");
+        const { harness, hostCalls } = await load();
+        const result = await harness.behavior.runCli(
+          ["call", "run_steps", "--file", "steps.json", "--host", "host_9"],
+          { cwd: dir },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(hostCalls.find((call) => call.method === "callTool")?.input).toMatchObject({
+          name: "run_steps",
+          arguments: nested,
+        });
+
+        const withBom = await load();
+        await writeFile(join(dir, "bom.json"), `\uFEFF${JSON.stringify(nested)}`, "utf8");
+        expect((await withBom.harness.behavior.runCli(["call", "run_steps", "--file", "bom.json"], { cwd: dir })).exitCode).toBe(0);
+        expect(withBom.hostCalls.find((call) => call.method === "callTool")?.input).toMatchObject({ arguments: nested });
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("accepts @path and --base64 as quote-safe alternatives", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "cua-call-"));
+      try {
+        await writeFile(join(dir, "steps.json"), JSON.stringify(nested), "utf8");
+        const viaFile = await load();
+        expect((await viaFile.harness.behavior.runCli(["call", "run_steps", "@steps.json"], { cwd: dir })).exitCode).toBe(0);
+        expect(viaFile.hostCalls.find((call) => call.method === "callTool")?.input).toMatchObject({ arguments: nested });
+
+        const viaBase64 = await load();
+        const encoded = Buffer.from(JSON.stringify(nested), "utf8").toString("base64");
+        expect((await viaBase64.harness.behavior.runCli(["call", "run_steps", "--base64", encoded])).exitCode).toBe(0);
+        expect(viaBase64.hostCalls.find((call) => call.method === "callTool")?.input).toMatchObject({ arguments: nested });
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("keeps inline JSON and rejects conflicting or malformed input", async () => {
+      const inline = await load();
+      expect((await inline.harness.behavior.runCli(["call", "list_windows", '{"pid":12664}'])).exitCode).toBe(0);
+      expect(inline.hostCalls.find((call) => call.method === "callTool")?.input).toMatchObject({
+        name: "list_windows",
+        arguments: { pid: 12664 },
+      });
+
+      const broken = await load();
+      const malformed = await broken.harness.behavior.runCli(["call", "run_steps", "{steps:[]}"]);
+      expect(malformed.exitCode).toBe(1);
+      expect(malformed.stderr).toMatch(/--file <path>/);
+      expect(broken.hostCalls.some((call) => call.method === "callTool")).toBe(false);
+
+      const conflict = await load();
+      const both = await conflict.harness.behavior.runCli(["call", "run_steps", '{"steps":[]}', "--base64", "e30="]);
+      expect(both.exitCode).toBe(1);
+      expect(both.stderr).toMatch(/one place only/);
+    });
+
+    it("reports missing files and explains why stdin is unavailable", async () => {
+      const missing = await (await load()).harness.behavior.runCli(["call", "run_steps", "--file", "nope.json"]);
+      expect(missing.exitCode).toBe(1);
+      expect(missing.stderr).toMatch(/Could not read arguments file/);
+
+      const stdin = await (await load()).harness.behavior.runCli(["call", "run_steps", "--stdin"]);
+      expect(stdin.exitCode).toBe(1);
+      expect(stdin.stderr).toMatch(/cannot read stdin/);
+    });
   });
 });
